@@ -33,7 +33,6 @@ import io.airbyte.db.jdbc.NoOpJdbcStreamingQueryConfiguration;
 import io.airbyte.integrations.base.IntegrationRunner;
 import io.airbyte.integrations.base.Source;
 import io.airbyte.integrations.source.jdbc.AbstractJdbcSource;
-import io.airbyte.integrations.source.jdbc.SourceJdbcUtils;
 import io.airbyte.integrations.source.relationaldb.TableInfo;
 import io.airbyte.protocol.models.CommonField;
 import org.apache.commons.dbcp2.BasicDataSource;
@@ -70,9 +69,8 @@ public class DruidSource extends AbstractJdbcSource implements Source {
   private static final String INTERNAL_COLUMN_TYPE = "columnType";
   private static final String INTERNAL_COLUMN_TYPE_NAME = "columnTypeName";
 
-
   public DruidSource() {
-    super(DRIVER_CLASS, new NoOpJdbcStreamingQueryConfiguration());
+    super(DRIVER_CLASS, new NoOpJdbcStreamingQueryConfiguration(), new DruidSourceOperations());
   }
 
   @Override
@@ -116,6 +114,7 @@ public class DruidSource extends AbstractJdbcSource implements Source {
 
   @Override
   public JdbcDatabase createDatabase(JsonNode config) throws SQLException {
+    LOGGER.info("Created druid database \n");
     JsonNode jdbcConfig = toDatabaseConfig(config);
     return (createDruidDatabase(jdbcConfig.get("username").asText(),
 			        jdbcConfig.get("password").asText(),
@@ -125,64 +124,9 @@ public class DruidSource extends AbstractJdbcSource implements Source {
 
   @Override
   public Set<String> getExcludedInternalNameSpaces() {
-    return Collections.singleton("system");
+    return Set.of(
+      "metadata");
   }
-
-  // We need to override this method to handle __time comumn from druid. Druid stores the time
-  // column with the type value '1111' which is a implementation specific type. The standard method defined
-  // in AbstractJdbcSource sets the type as JDBCType::OTHER which is not understood by the later
-  // code. We force the type of this column to JDBCType:BIGINT, since airbyte sees is pretty much like
-  // BIGINT. 
-  @Override
-  protected List<TableInfo<CommonField<JDBCType>>> discoverInternal(JdbcDatabase database, String schema) throws Exception {
-    final Set<String> internalSchemas = new HashSet<>(getExcludedInternalNameSpaces());
-    return database.bufferedResultSetQuery(
-        conn -> conn.getMetaData().getColumns(null, schema, null, null),
-        resultSet -> Jsons.jsonNode(ImmutableMap.<String, Object>builder()
-            // we always want a namespace, if we cannot get a schema, use db name.
-            .put(INTERNAL_SCHEMA_NAME,
-                resultSet.getObject(JDBC_COLUMN_SCHEMA_NAME) != null ? resultSet.getString(JDBC_COLUMN_SCHEMA_NAME)
-                    : resultSet.getObject(JDBC_COLUMN_DATABASE_NAME))
-            .put(INTERNAL_TABLE_NAME, resultSet.getString(JDBC_COLUMN_TABLE_NAME))
-            .put(INTERNAL_COLUMN_NAME, resultSet.getString(JDBC_COLUMN_COLUMN_NAME))
-            .put(INTERNAL_COLUMN_TYPE, resultSet.getString(JDBC_COLUMN_DATA_TYPE))
-            .put(INTERNAL_COLUMN_TYPE_NAME, resultSet.getString(JDBC_COLUMN_DATA_TYPE_NAME))
-            .build()))
-        .stream()
-        .filter(t -> !internalSchemas.contains(t.get(INTERNAL_SCHEMA_NAME).asText()))
-        // group by schema and table name to handle the case where a table with the same name exists in
-        // multiple schemas.
-        .collect(Collectors.groupingBy(t -> ImmutablePair.of(t.get(INTERNAL_SCHEMA_NAME).asText(), t.get(INTERNAL_TABLE_NAME).asText())))
-        .values()
-        .stream()
-        .map(fields -> TableInfo.<CommonField<JDBCType>>builder()
-            .nameSpace(fields.get(0).get(INTERNAL_SCHEMA_NAME).asText())
-            .name(fields.get(0).get(INTERNAL_TABLE_NAME).asText())
-            .fields(fields.stream()
-                .map(f -> {
-                  JDBCType jdbcType;
-                  try {
-                    if ((f.get(INTERNAL_COLUMN_TYPE).asInt() == 1111) && 
-                        (f.get(INTERNAL_COLUMN_TYPE_NAME).asText().equals("TIMESTAMP_WITH_LOCAL_TIME_ZONE(0) NOT NULL"))) {
-                       jdbcType = JDBCType.valueOf("BIGINT");
-		    } else {
-                       jdbcType = JDBCType.valueOf(f.get(INTERNAL_COLUMN_TYPE).asInt());
-                    }
-                  } catch (IllegalArgumentException ex) {
-                    LOGGER.warn(String.format("Could not convert column: %s from table: %s.%s with type: %s. Casting to VARCHAR.",
-                        f.get(INTERNAL_COLUMN_NAME),
-                        f.get(INTERNAL_SCHEMA_NAME),
-                        f.get(INTERNAL_TABLE_NAME),
-                        f.get(INTERNAL_COLUMN_TYPE)));
-                    jdbcType = JDBCType.VARCHAR;
-                  }
-                  return new CommonField<JDBCType>(f.get(INTERNAL_COLUMN_NAME).asText(), jdbcType) {};
-                })
-                .collect(Collectors.toList()))
-            .build())
-        .collect(Collectors.toList());
-  }
-
 
   public static void main(String[] args) throws Exception {
     final Source source = new DruidSource();
